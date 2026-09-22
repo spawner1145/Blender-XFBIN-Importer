@@ -30,6 +30,8 @@ from .common.helpers import (XFBIN_DYNAMICS_OBJ, XFBIN_ANMS_OBJ, XFBIN_TEXTURES_
                              int_to_hex_str)
 from .common.shaders import (shaders_dict, collision_mat)
 import cProfile
+from .animation_import import make_actions
+from ..xfbin_lib.xfbin.animation_reader import read_animation_xfbin
 
 class ImportXFBIN(Operator, ImportHelper):
     """Loads an XFBIN file into blender"""
@@ -56,12 +58,18 @@ class ImportXFBIN(Operator, ImportHelper):
 
     import_modelhit: BoolProperty(name='Import Stage Collision', default=True)
 
+    animations_only: BoolProperty(name="Animations Only", default=False,
+        description="Append all matching animations to existing XFBIN armatures")
+
     def draw(self, context):
         layout = self.layout
 
         layout.use_property_split = True
         layout.use_property_decorate = True
 
+        layout.prop(self, 'animations_only')
+        if self.animations_only:
+            return
         layout.prop(self, 'import_textures')
         layout.prop(self, "clear_textures")
         layout.prop(self, 'skip_lod_tex')
@@ -71,14 +79,18 @@ class ImportXFBIN(Operator, ImportHelper):
     def execute(self, context):
 
         start_time = time.time()
-        for file in self.files:
-            
-            self.filepath = os.path.join(self.directory, file.name)
+        paths = [os.path.join(self.directory, f.name) for f in self.files] or [self.filepath]
+        for filepath in paths:
+            self.filepath = filepath
 
             importer = XfbinImporter(
                 self, self.filepath, self.as_keywords(ignore=("filter_glob",)))
 
-            importer.read(context)
+            try:
+                importer.read(context)
+            except Exception as error:
+                self.report({"ERROR"}, str(error))
+                return {"CANCELLED"}
 
         elapsed_s = "{:.2f}s".format(time.time() - start_time)
         self.report({'INFO'}, "XFBIN import finished in " + elapsed_s)
@@ -102,12 +114,15 @@ class XfbinImporter:
         self.clear_textures = import_settings.get('clear_textures')
         self.skip_lod_tex = import_settings.get('skip_lod_tex')
         self.import_modelhit = import_settings.get('import_modelhit')
+        self.animations_only = import_settings.get('animations_only', False)
 
     xfbin: Xfbin
     collection: bpy.types.Collection
 
     def read(self, context):
-        self.xfbin = read_xfbin(self.filepath)
+        reader = read_animation_xfbin if self.animations_only else read_xfbin
+        self.xfbin = reader(self.filepath)
+        self.armatures = []
         self.collection = self.make_collection(context)
 
         # Storing specific chunks in lists would help with importing them in a specific order
@@ -118,7 +133,7 @@ class XfbinImporter:
         anm_chunks: List[NuccChunkAnm] = list()
         cam_chunks: List[NuccChunkCamera] = list()
 
-        if self.clear_textures:
+        if self.clear_textures and not self.animations_only:
             bpy.context.scene.xfbin_texture_chunks_data.clear()
 
 
@@ -135,7 +150,8 @@ class XfbinImporter:
             
 
         # Set the Xfbin textures properties
-        bpy.context.scene.xfbin_texture_chunks_data.init_data(texture_chunks)
+        if not self.animations_only:
+            bpy.context.scene.xfbin_texture_chunks_data.init_data(texture_chunks)
 
         # Import all clump chunks
         for clump in clump_chunks:
@@ -147,6 +163,7 @@ class XfbinImporter:
                     {'WARNING'}, f'Some chunks in {clump.name} have unsupported types and will not be imported')'''
 
             armature_obj = self.make_armature(clump, context)
+            self.armatures.append(armature_obj)
             self.make_objects(clump, armature_obj, context)
 
             # Set the armature as the active object after importing everything
@@ -167,25 +184,13 @@ class XfbinImporter:
         empty_anm.empty_display_size = 0
 
         self.collection.objects.link(empty_anm)
-        empty_anm.xfbin_anm_chunks_data.init_data(anm_chunks, cam_chunks, context)
-        for anm in anm_chunks: # Create camera objects for each anm that has a camera chunk
-            for cam in cam_chunks:
-                if anm.filePath != cam.filePath: # If cam and anm have same filepath they're in the same page
-                    continue
-                
-                anm: NuccChunkAnm
-                cam: NuccChunkCamera
-
-                cam_data = bpy.data.cameras.new(f"{cam.name} ({anm.name})")
-                cam_data.lens_unit = 'MILLIMETERS'
-                cam_data.lens = focal_to_blender(cam.fov, 36.0)
-
-                camera = bpy.data.objects.new(f"{cam.name} ({anm.name})", cam_data)
-                camera.rotation_mode = 'QUATERNION'
-                camera.animation_data_create()
-                camera.animation_data.action = bpy.data.actions.get(f"{anm.name} (camera)")
-                
-                self.collection.objects.link(camera)
+        empty_anm.xfbin_anm_chunks_data.init_data(
+            anm_chunks, cam_chunks, context, self.armatures, self.filepath, self.collection)
+        warnings = sorted({w for anm in anm_chunks for w in getattr(anm, 'import_warnings', [])})
+        if warnings:
+            for warning in warnings:
+                print('XFBIN:', warning)
+            self.operator.report({'WARNING'}, f'{len(warnings)} animation warnings; see console. ' + warnings[0])
 
     def make_collection(self, context) -> bpy.types.Collection:
         """
@@ -351,6 +356,15 @@ class XfbinImporter:
                     empty.parent_type = 'BONE'
                     empty.parent_bone = mesh_bone.name
 
+                    # Blender bones cannot retain reflected/scaled rest matrices.
+                    # Keep that residual on the rigid model's parent, also
+                    # cancelling Blender's bone-tail parenting offset.
+                    bone_parent_matrix = mesh_bone.matrix_local @ Matrix.Translation(
+                        (0, mesh_bone.length, 0))
+                    empty.matrix_parent_inverse = (
+                        bone_parent_matrix.inverted_safe()
+                        @ nucc_model.coord_chunk.node.matrix)
+
                     '''const = empty.constraints.new('CHILD_OF')
                     const.target = armature_obj
                     const.subtarget = mesh_bone.name
@@ -382,6 +396,21 @@ class XfbinImporter:
                     # Convert the BMesh to a blender Mesh
                     new_bmesh.to_mesh(overall_mesh)
                     new_bmesh.free()
+
+                    # Some reflected rigid meshes (e.g. Pain's right eye) have
+                    # winding opposite their authored normals. Match the two
+                    # before installing split normals to avoid a black eye in
+                    # Blender's lighting. UVs are assigned below, after flipping.
+                    if (mesh_bone and bone_range == (0, 0)
+                            and len(custom_normals) == len(overall_mesh.vertices)
+                            and nucc_model.coord_chunk.node.matrix.determinant() < 0):
+                        opposing = sum(
+                            poly.normal.dot(sum(
+                                (Vector(custom_normals[vi]) for vi in poly.vertices),
+                                Vector())) < 0
+                            for poly in overall_mesh.polygons)
+                        if opposing > len(overall_mesh.polygons) / 2:
+                            overall_mesh.flip_normals()
 
                     # Use the custom normals we made eariler
                     # Blender 4.1+ manages split normals automatically.
@@ -702,236 +731,6 @@ class XfbinImporter:
                 pass
 
         return bm
-
-def make_actions(anm: NuccChunkAnm, context) -> List[Action]:
-    actions = list()
-
-    try:
-        for entry in anm.other_entries:
-            entry: AnmEntry
-
-            action = bpy.data.actions.new(
-                f'{anm.name} ({AnmEntryFormat(entry.entry_format).name.lower()})')
-            
-            group_name = action.groups.new(anm.name).name
-
-            for curve in entry.curves:
-                if curve is None or (not len(curve.keyframes)) or curve.data_path == AnmDataPath.UNKNOWN:
-                    continue
-
-                frames = list(
-                    map(lambda x: frame_to_blender(x.frame), curve.keyframes))
-                
-                values = convert_anm_values(curve.data_path, list(
-                    map(lambda x: x.value, curve.keyframes)))
-
-                if curve.data_path == AnmDataPath.CAMERA:
-                    # TODO: change camera rotation mode to quaternion, and lens unit to FOV
-                    # This should be done on playing the animation chunk
-                    data_path = 'data.lens'
-                else:
-                    data_path = f'{AnmDataPath(curve.data_path).name.lower()}'
-
-
-                for i in range(len(values[0])):
-                    fc = action.fcurves.new(
-                        data_path=data_path, index=i, action_group=group_name)
-                    fc.keyframe_points.add(len(frames))
-                    fc.keyframe_points.foreach_set('co', [x for co in list(
-                        map(lambda f, v: (f, v[i]), frames, values)) for x in co])
-
-                    fc.update()
-        
-        for clump in anm.clumps:
-            action = bpy.data.actions.new(f'{anm.name} ({clump.name})')
-
-            arm_obj = bpy.data.objects.get(clump.chunk.name)
-            if arm_obj is None:
-                arm_obj = bpy.data.objects.get(clump.chunk.name + ' [C]')
-
-            arm_sca = dict()
-            arm_mat = dict()
-            arm_rot = dict()
-
-            if arm_obj is not None:
-                context.view_layer.objects.active = arm_obj
-                bpy.ops.object.mode_set(mode='EDIT')
-
-                for arm_bone in arm_obj.data.edit_bones:
-                    arm_sca[arm_bone.name] = arm_bone.get('scale_signs')
-                    arm_mat[arm_bone.name] = Matrix(arm_bone.get('matrix'))
-                    arm_rot[arm_bone.name] = Euler(arm_bone['orig_coords'][1])
-                
-                bpy.ops.object.mode_set(mode='POSE')
-                for arm_bone in arm_obj.pose.bones:
-                    arm_bone.rotation_mode = "QUATERNION"
-                    
-                bpy.ops.object.mode_set(mode='EDIT')
-
-            for bone in clump.bones:
-                group_name = action.groups.new(bone.name).name
-
-                if bone.anm_entry is None:
-                    continue
-
-
-
-                mat_parent = arm_mat.get(bone.parent.name, Matrix.Identity(
-                    4)) if bone.parent else Matrix.Identity(4)
-                mat = arm_mat.get(bone.name, Matrix.Identity(4))
-
-                mat = (mat_parent.inverted() @ mat)
-                loc, rot, sca = mat.decompose()
-                rot.invert()
-                sca = Vector(map(lambda a: 1/a, sca))
-
-                rotate_vector = arm_rot.get(bone.name,Euler([0,0,0]))
-
-                bone_path = f'pose.bones["{group_name}"]'
-
-                bone_parent = False
-                if bone.parent:
-                    bone_parent = True
-
-
-                for curve in bone.anm_entry.curves:
-                    if curve is None or (not len(curve.keyframes)) or curve.data_path == AnmDataPath.UNKNOWN:
-                        continue
-
-                    frames = list(
-                        map(lambda x: frame_to_blender(x.frame), curve.keyframes))
-
-                    if (bone.parent != None):
-                        values = convert_anm_values_tranformed(curve.data_path, list(
-                            map(lambda x: x.value, curve.keyframes)), loc, rot, sca, rotate_vector, bone_parent)
-                    else:
-                        values = convert_anm_values_tranformed_root(curve.data_path, list(
-                            map(lambda x: x.value, curve.keyframes)), loc, rot, sca)
-
-                    if (curve.data_path == AnmDataPath.ROTATION_EULER):
-                        curve.data_path = AnmDataPath.ROTATION_QUATERNION
-
-                    data_path = f'{bone_path}.{AnmDataPath(curve.data_path).name.lower()}'
-
-                    for i in range(len(values[0])):
-                        fc = action.fcurves.new(
-                            data_path=data_path, index=i, action_group=group_name)
-                        fc.keyframe_points.add(len(frames))
-                        fc.keyframe_points.foreach_set('co', [x for co in list(
-                            map(lambda f, v: (f, v[i]), frames, values)) for x in co])
-
-                        fc.update()
-
-            actions.append(action)
-    except Exception as e:
-        print(e)
-
-
-    # Create the constraints for the armatures if they exist
-    for p in anm.coord_parents:
-        if anm.clumps[p.parent_clump_index] != anm.clumps[p.child_clump_index]: # The parent and child clump are different, so it's a constraint
-
-            arm_obj = bpy.data.objects.get(anm.clumps[p.child_clump_index].chunk.name + ' [C]')
-            target_arm_obj = bpy.data.objects.get(anm.clumps[p.parent_clump_index].chunk.name + ' [C]')
-            target_bone = anm.clumps[p.parent_clump_index].bones[p.parent_coord_index].name
-
-            if arm_obj and target_arm_obj:
-                # Create the child of constraint for the armature using the target armature and bone
-
-                # Set the armature as the active object
-                context.view_layer.objects.active = arm_obj
-
-                # Check if the 'Child Of' constraint already exists, if not, add it
-                if 'Child Of' not in arm_obj.constraints:
-                    childof_constraint = arm_obj.constraints.new(type='CHILD_OF')
-                else:
-                    childof_constraint = arm_obj.constraints['Child Of']
-
-                # Set the 'Child Of' constraint properties
-                childof_constraint.target = target_arm_obj
-                childof_constraint.subtarget = target_bone
-                childof_constraint.inverse_matrix = Matrix.Identity(4)
-            else: # One of the armatures doesn't exist
-                print(f"Couldn't find one of the constraint armatures: {anm.clumps[p.child_clump_index].chunk.name + ' [C]'}")
-                
-
-    bpy.ops.object.mode_set(mode='POSE')
-    context.scene.render.fps = 30
-
-    return actions
-
-
-
-
-
-def convert_anm_values_tranformed(data_path: AnmDataPath, values, loc: Vector, rot: Quaternion, sca: Vector, rotate_vector: Euler, parent: bool):
-    if data_path == AnmDataPath.LOCATION:
-        updated_values = list()
-        for value_loc in values:
-            vec_loc = Vector([value_loc[0],value_loc[1],value_loc[2]])
-            vec_loc.rotate(rot)
-            updated_values.append(vec_loc)
-        updated_loc = loc
-        updated_loc.rotate(rot)
-
-        return list(map(lambda x: ((x*0.01) - updated_loc)[:], updated_values))
-
-    if data_path == AnmDataPath.ROTATION_EULER:
-        return list(map(lambda x: (rot @ ((rot_to_blender(x).to_quaternion()).to_euler()).to_quaternion())[:], values))
-
-    if data_path == AnmDataPath.ROTATION_QUATERNION:
-        quat_list = list()
-        updated_rot2 = Euler([math.radians(rotate_vector[0]),math.radians(rotate_vector[1]),math.radians(rotate_vector[2])]).to_quaternion()
-
-        for rotation in values:
-            q = rot.conjugated().copy()
-            q.rotate(rot)
-            quat = q
-            q = rot.conjugated().copy()
-
-            if not parent:
-                q.rotate(Quaternion((rotation[3], *rotation[:3])).conjugated())
-            else:
-                q.rotate(Quaternion((rotation[3], *rotation[:3])))
-            quat.rotate(q.conjugated())
-
-            quat_list.append(quat)
-
-        return quat_list
-
-    if data_path == AnmDataPath.SCALE:
-        return list(map(lambda x: (Vector(([abs(y) for y in x])))[:], values))
-    return values
-
-
-
-
-def convert_anm_values_tranformed_root(data_path: AnmDataPath, values, loc: Vector, rot: Quaternion, sca: Vector):
-    if data_path == AnmDataPath.LOCATION:
-        return list(map(lambda x: (loc + pos_cm_to_m(x))[:], values))
-    if data_path == AnmDataPath.ROTATION_EULER:
-        return list(map(lambda x: (((rot_to_blender(x).to_quaternion()).to_euler()).to_quaternion())[:], values))
-    if data_path == AnmDataPath.ROTATION_QUATERNION:
-        return list(map(lambda x: (Quaternion((x[3], *x[:3])).inverted())[:], values))
-    if data_path == AnmDataPath.SCALE:
-        return list(map(lambda x: (Vector(([abs(y) for y in x])))[:], values))
-    return values
-
-
-def convert_anm_values(data_path: AnmDataPath, values):
-    if data_path == AnmDataPath.LOCATION:
-        return list(map(lambda x: pos_cm_to_m_tuple(x), values))
-    if data_path == AnmDataPath.ROTATION_EULER:
-        return list(map(lambda x: rot_to_blender(x)[:], values))
-    if data_path == AnmDataPath.ROTATION_QUATERNION:
-        return list(map(lambda x: Quaternion((x[3], *x[:3])).inverted()[:], values))
-    if data_path == AnmDataPath.SCALE:
-        return list(map(lambda x: Vector(([abs(y) for y in x]))[:], values))
-    if data_path == AnmDataPath.CAMERA:
-        return list(map(lambda x: (focal_to_blender(x[0], 36.0),), values))
-
-    return values
-
 
 def menu_func_import(self, context):
     self.layout.operator(ImportXFBIN.bl_idname,

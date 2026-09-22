@@ -632,10 +632,14 @@ class NuccChunkAnm(NuccChunk):
         self.coord_parents: List[BrAnmCoordParent] = br_chunk.coord_parents
         # Set up the child-parent relations in AnmBones
         for p in self.coord_parents:
-            if -1 in [p.parent_clump_index, p.parent_coord_index, p.child_clump_index, p.child_coord_index]:
+            if p.parent_clump_index < 0 or p.child_clump_index < 0 or 0xFFFF in (p.parent_coord_index, p.child_coord_index):
                 continue
             
             p: BrAnmCoordParent
+            if not (p.parent_clump_index < len(self.clumps) and p.child_clump_index < len(self.clumps)):
+                raise ValueError("Animation parent clump index is out of range")
+            if not (p.parent_coord_index < len(self.clumps[p.parent_clump_index].bones) and p.child_coord_index < len(self.clumps[p.child_clump_index].bones)):
+                raise ValueError("Animation parent bone index is out of range")
             parent = self.clumps[p.parent_clump_index].bones[p.parent_coord_index]
             child = self.clumps[p.child_clump_index].bones[p.child_coord_index]
             child.parent = parent

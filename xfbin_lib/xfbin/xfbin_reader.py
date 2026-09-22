@@ -45,6 +45,9 @@ def read_xfbin(file: Union[str, bytearray]) -> Xfbin:
             chunk: NuccChunk = chunks[br_page.pageChunkIndices[index]]
 
             # Initialize the NuccChunk's data using the BrNuccChunk, the list of chunks, and the indices from the page
+            if type(chunk).__name__ in ("NuccChunkAnm", "NuccChunkCamera"):
+                chunk = NuccChunk.create_from_nucc_type(*table.get_props_from_chunk_map(
+                    table.chunkMaps[br_page.pageChunkIndices[index]]))
             chunk.init_data(br_page.chunksDict[index], chunks,
                             br_page.pageChunkIndices, page.chunk_references)
 

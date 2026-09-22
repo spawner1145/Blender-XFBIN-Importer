@@ -46,6 +46,9 @@ class AnmCurveFormat(IntEnum):
     FLOAT3ALT2 = 0x15  # scale
     FLOAT1ALT = 0x16  # lightdirc
     FLOAT1ALT2 = 0x18  # material
+    FLOAT3_NOINTERP = 0x1A
+    SHORT4_NOINTERP = 0x1B
+    SHORT1_NOINTERP = 0x1D
 
 
 class BrAnmCurveHeader(BrStruct):
@@ -72,7 +75,7 @@ class BrAnmEntry(BrStruct):
             curve = [None] * header.keyframe_count
 
             # More mini optimizations that make the code a lot less readable
-            if header.curve_format == AnmCurveFormat.FLOAT3:  # 0x05
+            if header.curve_format in (AnmCurveFormat.FLOAT3, AnmCurveFormat.FLOAT3_NOINTERP):  # 0x05
                 for i in range(header.keyframe_count):
                     curve[i] = br.read_float(3)
 
@@ -96,7 +99,7 @@ class BrAnmEntry(BrStruct):
                 for i in range(header.keyframe_count):
                     curve[i] = (br.read_int32(), br.read_float())
 
-            elif header.curve_format == AnmCurveFormat.SHORT1:  # 0x0F
+            elif header.curve_format in (AnmCurveFormat.SHORT1, AnmCurveFormat.SHORT1_NOINTERP):  # 0x0F
                 for i in range(header.keyframe_count):
                     curve[i] = br.read_int16(1)
 
@@ -104,7 +107,7 @@ class BrAnmEntry(BrStruct):
                 for i in range(header.keyframe_count):
                     curve[i] = br.read_int16(3)
 
-            elif header.curve_format == AnmCurveFormat.SHORT4:  # 0x11
+            elif header.curve_format in (AnmCurveFormat.SHORT4, AnmCurveFormat.SHORT4_NOINTERP):  # 0x11
                 for i in range(header.keyframe_count):
                     curve[i] = br.read_int16(4)
 
@@ -125,7 +128,7 @@ class BrAnmEntry(BrStruct):
                     curve[i] = br.read_float(1)
 
             else:
-                print(f'NuccChunkAnm: Unsupported curve format {header.curve_format}')
+                raise ValueError(f'NuccChunkAnm: unsupported curve format 0x{header.curve_format:02X}; refusing to read misaligned data')
 
             br.align_pos(4)
 
