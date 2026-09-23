@@ -53,6 +53,8 @@ classes = (
 
 
 def register():
+    from . import combat_sync
+    combat_sync.register()
     global XfbinPointersGroup
 
     for c in classes:
@@ -102,6 +104,8 @@ def register():
 
 
 def unregister():
+    from . import combat_sync
+    combat_sync.unregister()
     global XfbinPointersGroup
 
     del bpy.types.Object.xfbin_clump_data

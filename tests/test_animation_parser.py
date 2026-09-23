@@ -31,6 +31,12 @@ class AnimationParserTests(unittest.TestCase):
             self.assertEqual(len(curve.keyframes), 1)
         self.assertEqual(curve.keyframes[0].value, (0.5,))
 
+    def test_opacity_is_unsigned(self):
+        for fmt in (0x0F, 0x1D):
+            raw = self.read_entry(fmt, struct.pack('>H', 65535))
+            curve = anm.create_anm_curve(anm.AnmDataPath.TOGGLED, fmt, raw.curves[0], 100)
+            self.assertEqual(curve.keyframes[0].value, (65535 / 32768,))
+
     def test_unknown_format_fails(self):
         with self.assertRaisesRegex(ValueError, 'unsupported curve format'):
             self.read_entry(0xFE, b'')

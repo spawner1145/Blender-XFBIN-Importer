@@ -101,7 +101,7 @@ class BrAnmEntry(BrStruct):
 
             elif header.curve_format in (AnmCurveFormat.SHORT1, AnmCurveFormat.SHORT1_NOINTERP):  # 0x0F
                 for i in range(header.keyframe_count):
-                    curve[i] = br.read_int16(1)
+                    curve[i] = br.read_uint16(1)
 
             elif header.curve_format == AnmCurveFormat.SHORT3:  # 0x10
                 for i in range(header.keyframe_count):

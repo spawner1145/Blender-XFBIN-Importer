@@ -18,6 +18,20 @@ Thanks to the [Smash Forge](https://github.com/jam1garner/Smash-Forge) team for 
 
 ## Animation import (1.6.0)
 
+### Combat bundle development
+
+Explicitly assembled combat bundles can designate a master armature. Assigning
+a bundled Action to that armature in the Action Editor switches all registered
+component Actions and their slots. Components absent from that clip have their
+Actions cleared and `xfbin_combat_enabled` set to zero; the assembler must wire
+that property into visibility drivers. References persist after renaming and
+saving. This requires the updated add-on to remain enabled. Ordinary imported
+Actions do not automatically become combat bundles. NLA blending/time remapping
+is not implemented by this synchronizer.
+
+Run `blender -b --factory-startup --python-exit-code 1 --python tests/test_combat_sync.py`
+to verify switching, absent components, action slots, rename and save/reopen.
+
 Import the model first, then choose **File > Import > XFBIN** and enable
 **Animations Only** to append animations from one or more XFBIN files to existing
 XFBIN armatures. Normal model imports also use the corrected animation converter.
